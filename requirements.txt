@@ -1,8 +1,10 @@
 streamlit
 ultralytics
-opencv-python-headless
+opencv-python
 pandas
 plotly
 torch
 torchvision
-lap
+lapx
+imageio
+imageio-ffmpeg

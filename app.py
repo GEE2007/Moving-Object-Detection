@@ -2,6 +2,7 @@ import os
 import tempfile
 
 import cv2
+import imageio
 import pandas as pd
 import plotly.express as px
 import streamlit as st
@@ -91,51 +92,82 @@ def find_processed_video_path(save_dir, source_path):
     if not candidates:
         return None
 
+    # Sort candidates by modification time, most recent first
+    candidates.sort(key=lambda p: os.path.getmtime(p), reverse=True)
+
     for candidate in candidates:
         candidate_name = os.path.splitext(os.path.basename(candidate))[0].lower()
         if source_name in candidate_name:
             return candidate
 
-    return candidates[0]
+    return None
 
 
 def convert_video_to_mp4(video_path):
     if not video_path or not os.path.exists(video_path):
         return None
 
-    ext = os.path.splitext(video_path)[1].lower()
-    if ext == ".mp4":
-        return video_path
-
     output_path = os.path.splitext(video_path)[0] + ".mp4"
+    if output_path == video_path:
+        output_path = os.path.splitext(video_path)[0] + "_browser.mp4"
+
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
-        return None
-
-    fps = cap.get(cv2.CAP_PROP_FPS) or 20.0
-    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-
-    if width % 2:
-        width += 1
-    if height % 2:
-        height += 1
-
-    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-    writer = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
-    if not writer.isOpened():
         cap.release()
         return None
 
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            break
-        writer.write(frame)
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    if fps <= 0 or fps != fps:
+        fps = 30.0
 
-    cap.release()
-    writer.release()
-    return output_path
+    writer = None
+    success = False
+    frame_count = 0
+    try:
+        writer = imageio.get_writer(
+            output_path,
+            fps=fps,
+            codec="libx264",
+            pixelformat="yuv420p",
+            ffmpeg_params=["-vf", "pad=ceil(iw/2)*2:ceil(ih/2)*2"],
+        )
+
+        while cap.isOpened():
+            ret, frame = cap.read()
+            if not ret:
+                break
+            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            writer.append_data(frame_rgb)
+            frame_count += 1
+
+        # Finalize and close writer first before validating output
+        writer.close()
+        writer = None
+
+        # Verify writer closed, at least one frame was written, and output exists with non-zero size
+        if frame_count > 0 and os.path.exists(output_path) and os.path.getsize(output_path) > 0:
+            success = True
+    except Exception:
+        success = False
+    finally:
+        # 1. Guarantee writer is closed if an exception occurred before writer.close()
+        if writer is not None:
+            try:
+                writer.close()
+            except Exception:
+                pass
+
+        # 2. Guarantee OpenCV capture is released in every execution path
+        cap.release()
+
+        # 3. If conversion or finalization failed, delete incomplete output file
+        if not success and os.path.exists(output_path):
+            try:
+                os.remove(output_path)
+            except OSError:
+                pass
+
+    return output_path if success else None
 
 
 def run_yolo(video_path, confidence):
@@ -149,10 +181,25 @@ def run_yolo(video_path, confidence):
     save_dir = results[0].save_dir if results else None
     processed_video_path = find_processed_video_path(save_dir, video_path)
 
-    if processed_video_path and os.path.splitext(processed_video_path)[1].lower() != ".mp4":
-        converted_path = convert_video_to_mp4(processed_video_path)
+    if processed_video_path:
+        raw_video_path = processed_video_path
+        converted_path = convert_video_to_mp4(raw_video_path)
         if converted_path:
             processed_video_path = converted_path
+            # Safely remove intermediate raw unconverted file (e.g. .avi or non-browser .mp4)
+            if os.path.exists(raw_video_path) and raw_video_path != converted_path:
+                try:
+                    os.remove(raw_video_path)
+                except OSError:
+                    pass
+        else:
+            # Conversion failed: clean up the failed-run raw artifact
+            if os.path.exists(raw_video_path):
+                try:
+                    os.remove(raw_video_path)
+                except OSError:
+                    pass
+            processed_video_path = None
 
     detection_df = build_detection_dataframe(results)
 
@@ -316,6 +363,12 @@ if uploaded_video is not None and run:
         except Exception as exc:
             st.error(f"Detection failed: {exc}")
             st.stop()
+        finally:
+            if os.path.exists(temp_path):
+                try:
+                    os.remove(temp_path)
+                except OSError:
+                    pass
 
     st.success("✅ Detection Completed!")
 
@@ -335,7 +388,7 @@ if uploaded_video is not None and run:
 
         render_dashboard(uploaded_df)
     else:
-        st.error("Processed video not found.")
+        st.error("Processed video could not be generated or converted for display. Detection analytics are displayed below.")
         render_dashboard(uploaded_df)
 else:
     st.info("Upload a video and click Run Detection to generate fresh YOLOv8 results.")
